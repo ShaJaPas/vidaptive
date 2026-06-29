@@ -1,0 +1,126 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - master
+      - main
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: cargo fmt --check
+        run: cargo fmt --check
+
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: cargo clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+  cargo-udeps:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install nightly
+        uses: dtolnay/rust-toolchain@nightly
+      - uses: aig787/cargo-udeps-action@v1
+        with:
+          version: 'latest'
+          args: '--all-targets'
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-msrv
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-msrv
+      - name: Declared MSRV matches discovered minimum
+        run: |
+          set -euo pipefail
+          DECLARED=$(cargo msrv show --output-format minimal --no-log)
+          if [ -z "$DECLARED" ] || [ "$DECLARED" = "none" ]; then
+            echo "::error::rust-version is not set in Cargo.toml"
+            exit 1
+          fi
+          FOUND=$(cargo msrv find --output-format minimal --no-log --min 2024 -- cargo check --all-targets)
+          if [ -z "$FOUND" ] || [ "$FOUND" = "none" ]; then
+            echo "::error::cargo-msrv could not determine MSRV"
+            exit 1
+          fi
+          echo "Declared: $DECLARED"
+          echo "Found:    $FOUND"
+          if [ "$(jq -n --arg a "$DECLARED" --arg b "$FOUND" '
+            def norm($v): ($v | split(".") + ["0","0","0"])[0:3] | map(tonumber);
+            norm($a) == norm($b)
+          ')" != "true" ]; then
+            echo "::error::MSRV mismatch: Cargo.toml declares $DECLARED but cargo-msrv found $FOUND"
+            exit 1
+          fi
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable
+        uses: dtolnay/rust-toolchain@stable
+      - name: cargo test --locked
+        run: cargo test --locked --all-features --all-targets
+      # https://github.com/rust-lang/cargo/issues/6669
+      - name: cargo test --doc
+        run: cargo test --locked --all-features --doc
+
+  os-check:
+    runs-on: ${{ matrix.os }}
+    name: ${{ matrix.os }} / stable
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable
+        uses: dtolnay/rust-toolchain@stable
+      - name: cargo test
+        run: cargo test --locked --all-features --all-targets
+
+  coverage:
+    runs-on: ubuntu-latest
+    needs: test
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - name: cargo install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+      - name: cargo llvm-cov
+        run: cargo llvm-cov --locked --all-features --lcov --output-path lcov.info
+      - name: Upload to Coveralls
+        uses: coverallsapp/github-action@v2
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path-to-lcov: lcov.info

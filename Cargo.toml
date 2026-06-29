@@ -1,0 +1,29 @@
+[package]
+name = "vidaptive"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+description = "Responsive rate control for real-time video"
+readme = "README.md"
+license = "Apache-2.0"
+documentation = "https://docs.rs/vidaptive"
+homepage = "https://github.com/shajapas/vidaptive"
+repository = "https://github.com/shajapas/vidaptive"
+keywords = ["video", "congestion-control", "webrtc", "rate-control"]
+categories = ["network-programming", "multimedia"]
+
+[dependencies]
+bytes = "1.10"
+thiserror = "2"
+
+
+[lints.rust]
+missing_docs = "deny"
+unused_lifetimes = "deny"
+unused_qualifications = "deny"
+unreachable_pub = "deny"
+
+[lints.clippy]
+std_instead_of_core = "warn"
+std_instead_of_alloc = "warn"
+undocumented_unsafe_blocks = "deny"
