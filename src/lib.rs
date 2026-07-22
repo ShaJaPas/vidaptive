@@ -11,7 +11,7 @@ mod session;
 mod transport;
 mod types;
 
-pub use cc::{CongestionController, Copa, CopaConfig, NoopCc};
+pub use cc::{CongestionController, Copa, CopaConfig, NoopCc, Rocc, RoccConfig};
 pub use config::{ConfigError, VidaptiveConfig};
 pub use session::Vidaptive;
 pub use transport::filler::{BacklogFiller, DEFAULT_DUMMY_PACKET_SIZE, DummyFiller};

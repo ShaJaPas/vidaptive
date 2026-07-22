@@ -2,9 +2,11 @@
 
 mod copa;
 mod noop;
+mod rocc;
 
 pub use copa::{Copa, CopaConfig};
 pub use noop::NoopCc;
+pub use rocc::{Rocc, RoccConfig};
 
 use core::time::Duration;
 
@@ -28,6 +30,16 @@ pub trait CongestionController {
 
     /// Smoothed sending rate estimate (`CC-Rate`) in bytes per second.
     fn pacing_rate(&self) -> u64;
+
+    /// CC-Rate used for encoder target bitrate selection: `cwnd / sRTT`
+    /// (Vidaptive paper §3.1, line "CC-Rate, computed as the cwnd divided by
+    /// smoothed RTT"). This is the **throughput** estimate without any pacer
+    /// burst gain. `target = α · cc_rate()` (paper §3.3). `pacing_rate()`
+    /// (which may include a burst gain) is used only by the pacer.
+    fn cc_rate(&self) -> u64 {
+        // Default: same as pacing_rate() (e.g. ROCC already has no gain).
+        self.pacing_rate()
+    }
 
     /// Congestion window in bytes.
     fn cwnd(&self) -> u64;

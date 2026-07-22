@@ -502,6 +502,12 @@ impl CongestionController for Copa {
         PACING_GAIN.saturating_mul((self.cwnd() as f64 / secs) as u64)
     }
 
+    fn cc_rate(&self) -> u64 {
+        // Throughput estimate without pacer burst gain (paper §3.1).
+        let secs = self.rtt().as_secs_f64().max(1e-9);
+        (self.cwnd() as f64 / secs) as u64
+    }
+
     fn cwnd(&self) -> u64 {
         self.cwnd.max(self.config.min_cwnd)
     }
@@ -530,6 +536,7 @@ mod tests {
                 seq,
                 len: pkt_len,
                 sent_at: t0 + Duration::from_millis(seq),
+                app_limited: false,
             });
         }
 

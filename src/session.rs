@@ -1,6 +1,7 @@
 //! Vidaptive session: CC, pacer, filler, safeguards, and α control.
 
 use alloc::collections::BTreeMap;
+use core::time::Duration;
 use std::time::Instant;
 
 use crate::cc::CongestionController;
@@ -60,7 +61,7 @@ where
     pub fn new(cc: CC, filler: F, config: VidaptiveConfig) -> Self {
         let samples = FrameTimingBuffer::new(config.optimizer_window());
         let video_bitrate = VideoBitrateWindow::new(config.optimizer_window());
-        let pacing = cc.pacing_rate();
+        let pacing = cc.cc_rate();
         let cached_target_bitrate_bps = pacing.saturating_mul(8);
         let encoder = EncoderAdvice {
             target_bitrate_bps: cached_target_bitrate_bps,
@@ -114,7 +115,7 @@ where
             frame.id,
             FrameEncodeContext {
                 target_bitrate_bps: frame.target_bitrate,
-                cc_rate_bytes_per_sec: self.cc.pacing_rate(),
+                cc_rate_bytes_per_sec: self.cc.cc_rate(),
             },
         );
         self.pacer.enqueue_packets(frame.id, frame.packets, now);
@@ -145,6 +146,42 @@ where
     #[must_use]
     pub fn poll_transmit(&mut self, now: Instant) -> Option<TransmitAction> {
         self.poll_transmit_inner(now)
+    }
+
+    /// Whether the pacer has queued media packets waiting to be sent.
+    ///
+    /// Callers can use this to avoid polling for fillers when they intend to
+    /// skip them anyway — `poll_transmit` pre-registers a filler in the pacer
+    /// (incrementing `bytes_in_flight` and the pacer's seq) before returning
+    /// `SendFiller`, so skipping the send would leak a phantom packet that
+    /// inflates `bytes_in_flight` forever and diverges the seq counters.
+    #[must_use]
+    pub fn has_media(&self) -> bool {
+        self.pacer.has_media()
+    }
+
+    /// Number of packets currently waiting in the pacer queue.
+    #[must_use]
+    pub fn pacer_queue_len(&self) -> usize {
+        self.pacer.queue_len()
+    }
+
+    /// Age of the oldest packet still waiting in the pacer queue, if any.
+    #[must_use]
+    pub fn pacer_oldest_queued_age(&self, now: Instant) -> Option<Duration> {
+        self.pacer.oldest_queued_age(now)
+    }
+
+    /// Bytes currently in flight on the network (pacer accounting).
+    #[must_use]
+    pub fn bytes_in_flight(&self) -> u64 {
+        self.pacer.bytes_in_flight()
+    }
+
+    /// Whether the safeguards have paused the encoder (head-of-line queue too old).
+    #[must_use]
+    pub fn encoder_paused(&self) -> bool {
+        self.encoder.pause
     }
 
     /// Returns current encoder advice (bitrate, pause, α).
@@ -240,7 +277,7 @@ where
                         .copied()
                         .unwrap_or(FrameEncodeContext {
                             target_bitrate_bps: self.cached_target_bitrate_bps,
-                            cc_rate_bytes_per_sec: self.cc.pacing_rate(),
+                            cc_rate_bytes_per_sec: self.cc.cc_rate(),
                         });
                 FrameInFlight {
                     head_at: meta.at_head_at,
@@ -249,10 +286,14 @@ where
                 }
             });
 
+        // After pop, bif already includes this packet. If cwnd still has room
+        // and the pacer has no more media, this send was application-limited.
+        let app_limited = !self.pacer.has_media() && self.cc.can_send(self.pacer.bytes_in_flight());
         let sent = SentPacket {
             seq: meta.seq,
             len: meta.len,
             sent_at: now,
+            app_limited,
         };
         self.cc.on_packet_sent(&sent);
         self.pacer.record_send(meta.len, self.cc.pacing_rate(), now);
@@ -273,10 +314,12 @@ where
         let seq = self.pacer.next_seq();
         let _meta = self.pacer.register_filler(seq, len, now);
 
+        // Fillers intentionally probe spare capacity — never app-limited.
         let sent = SentPacket {
             seq,
             len,
             sent_at: now,
+            app_limited: false,
         };
         self.cc.on_packet_sent(&sent);
         self.pacer.record_send(len, self.cc.pacing_rate(), now);
@@ -342,8 +385,7 @@ where
     fn run_optimizer(&mut self, now: Instant) {
         let paused = self.safeguards.is_paused();
         let (alpha, target_bitrate_bps) =
-            self.alpha
-                .update(&self.samples, self.cc.pacing_rate(), paused);
+            self.alpha.update(&self.samples, self.cc.cc_rate(), paused);
         self.encoder.alpha = alpha;
         self.cached_target_bitrate_bps = if paused { 0 } else { target_bitrate_bps };
         self.last_optimizer_tick = now;
@@ -352,8 +394,21 @@ where
     fn refresh_encoder_state(&mut self, now: Instant) {
         let oldest = self.pacer.oldest_queued_age(now);
         self.safeguards.update(oldest, !self.pacer.has_media());
-        self.encoder.pause = self.safeguards.is_paused();
-        self.encoder.target_bitrate_bps = if self.encoder.pause {
+        let was_paused = self.encoder.pause;
+        let now_paused = self.safeguards.is_paused();
+
+        if now_paused && !was_paused {
+            // Entering pause: drop stale high target so unpause cannot
+            // instantly restore a pre-congestion 10 Mbps cache.
+            self.cached_target_bitrate_bps = 0;
+        } else if !now_paused && was_paused {
+            // Leaving pause: recompute α·cc_rate immediately instead of
+            // waiting up to optimizer_window with a zero/stale cache.
+            self.run_optimizer(now);
+        }
+
+        self.encoder.pause = now_paused;
+        self.encoder.target_bitrate_bps = if now_paused {
             0
         } else {
             self.cached_target_bitrate_bps
@@ -410,6 +465,42 @@ mod tests {
         let later = t0 + Duration::from_millis(10);
         session.refresh_encoder_state(later);
         assert!(session.encoder.pause);
+        assert_eq!(session.encoder.target_bitrate_bps, 0);
+        assert_eq!(session.cached_target_bitrate_bps, 0);
+    }
+
+    #[test]
+    fn unpause_recomputes_target_instead_of_restoring_stale_cache() {
+        let cc = NoopCc::new(100_000, 100_000, Duration::from_millis(50));
+        let config = VidaptiveConfig::builder()
+            .tau_pause(Duration::from_millis(1))
+            .optimizer_window(Duration::from_secs(10))
+            .build()
+            .unwrap();
+        let mut session = Vidaptive::new(cc, DummyFiller::new(), config);
+        let t0 = Instant::now();
+
+        // Seed a high cached target, then enter pause via backlog.
+        session.cached_target_bitrate_bps = 10_000_000;
+        session.encoder.target_bitrate_bps = 10_000_000;
+        session.encoder.pause = false;
+        session.enqueue_packets(frame(1, t0, 10_000_000, 2_000, 500), t0);
+        let paused_at = t0 + Duration::from_millis(10);
+        session.refresh_encoder_state(paused_at);
+        assert!(session.encoder.pause);
+        assert_eq!(session.cached_target_bitrate_bps, 0);
+
+        // Simulate queue drain: empty pacer → safeguards clear pause → optimizer runs.
+        session.pacer = Pacer::new();
+        let resumed_at = paused_at + Duration::from_millis(1);
+        session.refresh_encoder_state(resumed_at);
+        assert!(!session.encoder.pause);
+        // Fresh optimizer pass — not the stale 10 Mbps.
+        assert_ne!(session.encoder.target_bitrate_bps, 10_000_000);
+        assert_eq!(
+            session.encoder.target_bitrate_bps,
+            session.cached_target_bitrate_bps
+        );
     }
 
     #[test]

@@ -101,6 +101,11 @@ pub struct SentPacket {
     pub len: usize,
     /// Send timestamp.
     pub sent_at: Instant,
+    /// `true` when this packet was sent while the sender still had spare cwnd
+    /// but no further media to send (application-limited). Delay observed on
+    /// such packets must not drive Copa cwnd decreases — that is Vidaptive α /
+    /// safeguards territory, not network congestion from a full window.
+    pub app_limited: bool,
 }
 
 /// Receiver acknowledgement for a previously sent packet.

@@ -81,13 +81,24 @@ impl Pacer {
         !self.queue.is_empty()
     }
 
-    /// Age of the oldest queued packet, if any.
+    /// Number of packets currently waiting in the pacer queue.
+    #[must_use]
+    pub(crate) fn queue_len(&self) -> usize {
+        self.queue.len()
+    }
+
+    /// Age of the oldest queued packet (time since it was enqueued), if any.
+    ///
+    /// This measures how long the oldest packet has been *waiting in the
+    /// queue* (`now - queued_at`), which is what the safeguards need to detect
+    /// queue buildup. Do NOT use `at_head_at` here: that records when the packet
+    /// became head-of-line (for CC service-time), which stays ~0 while the FIFO
+    /// drains quickly even as the queue grows unbounded.
     #[must_use]
     pub(crate) fn oldest_queued_age(&self, now: Instant) -> Option<Duration> {
-        self.queue.first().map(|packet| {
-            let start = packet.at_head_at.unwrap_or(packet.queued_at);
-            now.saturating_duration_since(start)
-        })
+        self.queue
+            .first()
+            .map(|packet| now.saturating_duration_since(packet.queued_at))
     }
 
     /// Total bytes currently in flight on the network.
@@ -236,5 +247,35 @@ mod tests {
         assert_eq!(payload.len(), 50);
         assert!(meta.fin);
         assert!(!pacer.has_media());
+    }
+
+    /// `oldest_queued_age` must report time-since-enqueue for the oldest packet,
+    /// NOT time-since-it-became-head. When the FIFO drains steadily, every
+    /// packet becomes head only momentarily (`at_head_at` ≈ now), so using
+    /// `at_head_at` would yield ~0 and hide unbounded queue buildup from the
+    /// safeguards. The oldest packet's true wait is `now - queued_at`.
+    #[test]
+    fn oldest_queued_age_reflects_enqueue_time_not_head_time() {
+        let mut pacer = Pacer::new();
+        let t0 = Instant::now();
+
+        // Enqueue 10 packets at t0.
+        let packets = chunk_payload([0u8; 1200], 120);
+        pacer.enqueue_packets(1, packets, t0);
+        assert_eq!(pacer.queue_len(), 10);
+
+        // Drain 9 packets at t0+5s (FIFO moving). Each pop marks the next packet
+        // as head with at_head_at = now (t0+5s).
+        let drain_at = t0 + Duration::from_secs(5);
+        for _ in 0..9 {
+            let _ = pacer.pop_packet(drain_at);
+        }
+        assert_eq!(pacer.queue_len(), 1);
+
+        // The last remaining packet was enqueued at t0, became head at drain_at.
+        // Its true queue age at t0+6s is 6s (since enqueue), NOT ~1s (since head).
+        let later = t0 + Duration::from_secs(6);
+        let age = pacer.oldest_queued_age(later).expect("age");
+        assert_eq!(age, Duration::from_secs(6));
     }
 }
